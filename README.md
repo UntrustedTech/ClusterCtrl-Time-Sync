@@ -34,7 +34,7 @@ Follow these steps to get your Raspberry Pi cluster synchronized with Chrony NTP
 
 - Step 1: Clone Repository
 ```bash
-git clone https://github.com/yourusername/clusterctrl-time-sync.git
+git clone https://github.com/UntrustedTech/ClusterCtrl-Time-Sync.git
 cd clusterctrl-time-sync
 ```
 
