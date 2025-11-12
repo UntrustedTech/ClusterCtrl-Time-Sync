@@ -1,329 +1,365 @@
 #!/bin/bash
-# ClusterCtrl Time Sync v1.1 – Production
+# =============================================================================
+# Cluster HAT v2.0 Auto-Setup & Time Sync
+# Version: 1.2
 # Author: UntrustedTech
-# License: All Rights Reserved (no copying/distribution)
+# GitHub: https://github.com/UntrustedTech/ClusterCtrl-Time-Sync
+# =============================================================================
 
-set -euo pipefail
+# -----------------------------
+# Colors & Constants
+# -----------------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+SPINNER='⣾⣽⣻⢿⡿⣟⣯⣷'
+NODES=("p1" "p2" "p3" "p4")
 
-# === Colors & Symbols ===
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-PURPLE='\033[0;35m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m'
-CHECK="Checkmark"
-CROSS="Cross"
-WARN="Warning"
+# -----------------------------
+# Global State
+# -----------------------------
+ERRORS=""
+UPDATE_LOG="$HOME/.clusterctrl_update.log"
+TODAY=$(date +%Y-%m-%d)
+MASTER_NAME=$(hostname)
+MASTER_MODEL=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0' || echo "Unknown")
+MASTER_IP=$(ip route get 1.1.1.1 | awk '{print $7}' | head -1)
 
-VERSION="v1.1"
-LOGDIR="/tmp"
-LOGFILE="$LOGDIR/cluster_sync_$(date +%m%d_%H%M).log"
-CONFIG_FILE="$HOME/.cluster-sync.conf"
-
-# Redirect all output to log + screen
-exec > >(tee -a "$LOGFILE") 2>&1
-
-# === Arrays ===
-declare -a TASKS=()
-declare -a FAILED_NODES=()
-declare -A FAILURE_REASONS
-
-# === Helper: Spinner ===
-spin() {
-    local pid=$1 msg=${2:-}
-    local spin='⣾⣽⣻⢿⡿⣟⣯⣷'
+# -----------------------------
+# UI: Spinner & Status
+# -----------------------------
+spinner() {
+    local pid=$1 msg=$2
+    local i=0 delay=0.12
     while kill -0 $pid 2>/dev/null; do
-        printf " ${CYAN}%s${NC} %s  \r" "$msg" "${spin:i++%${#spin}:1}"
-        sleep 0.1
+        printf "\r  ${MAGENTA}${SPINNER:i++%8:1}${NC} %s" "$msg"
+        sleep $delay
     done
-    wait $pid 2>/dev/null || true
-    printf " ${GREEN}Done${NC}          \n"
+    printf "\r"
 }
 
-# === Load Config ===
-load_config() {
-    [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" && echo -e "   ${YELLOW}Config loaded${NC}"
-}
+status()  { echo -e "  ${GREEN}Success $1${NC}"; }
+warning() { echo -e "  ${YELLOW}Warning $1${NC}"; }
+error()   { echo -e "  ${RED}Failed $1${NC}"; }
+log_error() { ERRORS+="$1\n"; }
 
-# === Save Config ===
-save_config() {
-    cat > "$CONFIG_FILE" <<EOF
-SSH_USER="$SSH_USER"
-SSH_PASS="$SSH_PASS"
-MODE="$MODE"
-AUTH_METHOD="$AUTH_METHOD"
-EOF
-    chmod 600 "$CONFIG_FILE"
-    echo -e "   ${GREEN}Config saved${NC}"
-}
+# -----------------------------
+# Safe Execution: APT & SSH
+# -----------------------------
+run_cmd() {
+    local cmd="$1" desc="$2" node="${3:-}"
+    local prefix="${node:+${node}: }"
+    local spinner_pid exit_code
 
-# === Rotate Logs ===
-rotate_logs() {
-    find "$LOGDIR" -name "cluster_sync_*.log" | sort -r | tail -n +6 | xargs rm -f 2>/dev/null || true
-}
+    printf "  %s" "${prefix}${desc}"
+    eval "$cmd" &>/dev/null &
+    spinner_pid=$!
+    spinner $spinner_pid "$desc..."
 
-# === Wait for Node ===
-wait_for_node() {
-    local n=$1
-    printf "   ${BLUE}Waiting for p%s${NC}" "$n"
-    local t=0
-    while ! ping -c1 -W2 "p${n}.local" &>/dev/null && (( t < 120 )); do
-        printf "."; sleep 2; ((t++))
-    done
-    (( t >= 120 )) && printf " ${RED}Timeout${NC}\n" && return 1
-    sleep 5
-    printf " ${GREEN}Up${NC}\n"
-    return 0
-}
+    wait $spinner_pid
+    exit_code=$?
 
-# === Power On If Offline (Pre-flight) ===
-power_on_if_offline() {
-    local n=$1
-    if ping -c1 -W2 "p${n}.local" &>/dev/null; then
-        printf "   p%s: ${GREEN}%s${NC}\n" "$n" "$CHECK Online"
-        return 0
-    fi
-    printf "   p%s: ${RED}%s${NC} → ${YELLOW}Powering on...${NC}" "$n" "$CROSS Offline"
-    command -v clusterctrl >/dev/null || { echo -e "${RED}ERROR: clusterctrl not found${NC}"; exit 1; }
-    sudo clusterctrl on "p$n" >/dev/null 2>&1 || { printf " ${RED}Failed${NC}\n"; TASKS+=("Power On p$n" "Failed"); return 1; }
-    wait_for_node "$n" && {
-        printf "   p%s: ${GREEN}%s${NC}\n" "$n" "$CHECK Online (powered on)"
-        TASKS+=("Power On p$n" "Success")
-        return 0
-    } || {
-        printf "   p%s: ${RED}%s${NC}\n" "$n" "$CROSS Still offline"
-        TASKS+=("Power On p$n" "Failed")
-        return 1
-    }
-}
-
-# === Pre-flight ===
-pre_flight_check() {
-    echo -e "\n${BOLD}${CYAN}Pre-flight Network Check${NC}\n────────────────────────────────"
-    local all_up=1
-    for n in {1..4}; do
-        power_on_if_offline "$n" || all_up=0
-    done
-    (( all_up )) && echo -e "   ${GREEN}All nodes ready.${NC}\n" || echo -e "   ${YELLOW}Proceeding with powered-on nodes...${NC}\n"
-}
-
-# === Run SSH Command with Retry ===
-run_ssh_cmd() {
-    local n=$1 cmd=$2 phase=$3
-    local max=3 delay=2
-    for ((a=1; a<=max; a++)); do
-        echo -n "$phase"
-        if (( USE_SSH_KEYS )); then
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@p${n}.local" "$cmd" > /tmp/ssh.log 2>&1 &
-        else
-            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@p${n}.local" "$cmd" > /tmp/ssh.log 2>&1 &
-        fi
-        local pid=$!
-        spin $pid "working"
-        wait $pid 2>/dev/null || true
-        if grep -q "successfully" /tmp/ssh.log 2>/dev/null || [ ! -s /tmp/ssh.log ]; then
-            TASKS+=("p$n: $phase" "Success"); return 0
-        fi
-        (( a < max )) && printf "   ${YELLOW}Retry $a (wait ${delay}s)${NC}\n" && sleep $delay && ((delay *= 2))
-    done
-    log_err "$n" "$phase failed" "check network"
-    TASKS+=("p$n: $phase" "Failed")
-    return 1
-}
-
-# === Log Error ===
-log_err() {
-    local n=$1 e=$2
-    echo -e "${RED}ERR p$n: $e${NC}" >&2
-    FAILURE_REASONS["p$n"]+="$e; "
-    FAILED_NODES+=("p$n")
-}
-
-# === Ensure Node On (Worker Loop) ===
-ensure_node_on() {
-    local n=$1
-    ping -c1 "p${n}.local" &>/dev/null && { printf "   ${GREEN}p%s online${NC}\n" "$n"; return 0; }
-    printf "   ${YELLOW}p%s off → powering on${NC}\n" "$n"
-    sudo clusterctrl on "p$n" >/dev/null 2>&1 || { log_err "$n" "clusterctrl failed"; return 1; }
-    wait_for_node "$n" || { log_err "$n" "boot timeout"; return 1; }
-    return 0
-}
-
-# === Verify Time Sync ===
-verify_time_sync() {
-    local n=$1
-    echo -n "   ${BLUE}Verifying time sync${NC}"
-    local output
-    if (( USE_SSH_KEYS )); then
-        output=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@p${n}.local" "chronyc sources" 2>/dev/null || echo "")
-    else
-        output=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@p${n}.local" "chronyc sources" 2>/dev/null || echo "")
-    fi
-    if echo "$output" | grep -q "^\*[[:space:]]*$MASTER_IP"; then
-        printf " ${GREEN}%s${NC}\n" "$CHECK Synced"
-        TASKS+=("p$n: time verify" "Success")
+    if [ $exit_code -eq 0 ]; then
+        echo -e "\r  ${prefix}${GREEN}Success $desc${NC}                    "
         return 0
     else
-        printf " ${RED}%s${NC}\n" "$CROSS Not synced"
-        TASKS+=("p$n: time verify" "Failed")
-        return 1
+        echo -e "\r  ${prefix}${YELLOW}Warning Retrying...${NC}                    "
+        sleep 2
+        eval "$cmd" &>/dev/null &
+        spinner_pid=$!
+        spinner $spinner_pid "$desc (retry)..."
+
+        wait $spinner_pid
+        exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
+            echo -e "\r  ${prefix}${GREEN}Success $desc (retry)${NC}                    "
+            return 0
+        else
+            echo -e "\r  ${prefix}${RED}Failed $desc failed${NC}          "
+            log_error "$node: $desc failed (code: $exit_code)"
+            return 1
+        fi
     fi
 }
 
-# === Deploy SSH Keys ===
-deploy_master_ssh_key() {
-    echo -e "\n${PURPLE}SSH Key Setup${NC}\n────────────────────────────────────"
-    [[ -f "$HOME/.ssh/id_rsa" ]] && echo "   ${YELLOW}Using existing key${NC}" || {
-        echo -n "   ${BLUE}Generating key${NC}"
-        ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/id_rsa" -q -N "" >/dev/null
-        printf " ${GREEN}%s${NC}\n" "$CHECK"
-        TASKS+=("SSH Key Generation" "Success")
+run_apt() { run_cmd "$1" "$2"; }
+run_ssh() { run_cmd "$1" "$2" "$3"; }
+
+# -----------------------------
+# Dependency: sshpass
+# -----------------------------
+ensure_sshpass() {
+    command -v sshpass &>/dev/null && return
+
+    print_header "Installing sshpass"
+    echo -e "${YELLOW}Required: sshpass (automated login)${NC}\n"
+
+    run_apt "sudo apt update" "Updating package list" || {
+        echo -e "\n${RED}APT update failed. Check internet or sources.${NC}"
+        exit 1
+    }
+    run_apt "sudo apt install -y sshpass" "Installing sshpass" || {
+        echo -e "\n${RED}Failed to install sshpass.${NC}"
+        exit 1
+    }
+    echo
+}
+
+# -----------------------------
+# UI: Header
+# -----------------------------
+print_header() {
+    clear
+    echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${BLUE}║${NC}       ${CYAN}Cluster HAT v2.0 Auto-Setup & Time Sync${NC}           ${BOLD}${BLUE}║${NC}"
+    echo -e "${BOLD}${BLUE}║${NC}  ${DIM}Author: UntrustedTech${NC}  •  ${DIM}v1.2${NC}  •  ${DIM}github.com/UntrustedTech${NC}  ${BOLD}${BLUE}║${NC}"
+    echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+    [[ -n "$1" ]] && echo -e "${BOLD}$1${NC}\n"
+}
+
+# -----------------------------
+# 1. Master Node
+# -----------------------------
+setup_master() {
+    print_header "MASTER NODE"
+    echo -e "  ${CYAN}Hardware:${NC} $MASTER_MODEL"
+    echo -e "  ${CYAN}Hostname:${NC} $MASTER_NAME\n"
+
+    [[ -f "$UPDATE_LOG" && $(cat "$UPDATE_LOG") == "$TODAY" ]] && {
+        status "Already updated today"; return
     }
 
-    local all_good=1
-    for n in {1..4}; do
-        ensure_node_on "$n" || { all_good=0; continue; }
-        echo -n "   ${BLUE}Deploying to p${n}${NC}"
-        sshpass -p "$SSH_PASS" ssh-copy-id -o StrictHostKeyChecking=no "$SSH_USER@p${n}.local" &>/tmp/sshcopy.log &
-        spin $! ""
-        if grep -q "added: 1" /tmp/sshcopy.log 2>/dev/null; then
-            printf " ${GREEN}%s${NC}\n" "$CHECK"
-            TASKS+=("SSH Deploy p$n" "Success")
-        else
-            printf " ${RED}%s${NC}\n" "$CROSS"
-            log_err "p$n" "ssh-copy-id failed"
-            TASKS+=("SSH Deploy p$n" "Failed")
-            all_good=0
-        fi
-    done
+    read -p " $(echo -e "${YELLOW}Update master? (y/n): ${NC}")" -n 1 -r; echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { warning "Skipped"; return; }
 
-    (( all_good )) && {
-        echo -e "\n   ${GREEN}Keys deployed${NC}"
-        for i in {5..1}; do printf "   ${CYAN}→ %s${NC} " "$i"; sleep 1; done; echo; echo
-        USE_SSH_KEYS=1
-    } || { echo -e "   ${YELLOW}Using password auth${NC}\n"; USE_SSH_KEYS=0; }
+    run_apt "sudo apt update" "Updating master"
+    run_apt "sudo apt full-upgrade -y" "Upgrading master"
+    echo "$TODAY" > "$UPDATE_LOG"
+    status "Update logged"
+
+    read -p " $(echo -e "${YELLOW}Reboot? (y/n): ${NC}")" -n 1 -r; echo
+    [[ $REPLY =~ ^[Yy]$ ]] && { echo -e "\n${GREEN}Rebooting...${NC}"; sleep 3; sudo reboot; }
 }
 
-# === Retry Failed ===
-retry_failed_nodes() {
-    (( ${#FAILED_NODES[@]} == 0 )) && return
-    echo -e "\n${BOLD}${YELLOW}Retry failed nodes? [Y/n]${NC}"
-    read -t 10 answer || answer="y"
-    [[ "$answer" =~ ^[Nn]$ ]] && return
+# -----------------------------
+# 2. Network Check
+# -----------------------------
+check_network() {
+    print_header "NETWORK CHECK"
+    status "Master ($MASTER_NAME) online"
 
-    local retry_list=("${FAILED_NODES[@]}")
-    FAILED_NODES=(); FAILURE_REASONS=()
-
-    for node in "${retry_list[@]}"; do
-        local n=${node#p}
-        echo -e "\n${BOLD}${CYAN}Retrying p$n${NC}\n──────"
-        local ok=1
-        ensure_node_on "$n" || ok=0
-        run_ssh_cmd "$n" "sudo apt update -y" "   ${BLUE}Update${NC}" || ok=0
-        run_ssh_cmd "$n" "sudo apt full-upgrade -y" "   ${BLUE}Upgrade${NC}" || ok=0
-        run_ssh_cmd "$n" "sudo apt autoremove -y" "   ${BLUE}Clean${NC}" || ok=0
-        # Reboot
-        echo -n "   ${BLUE}Reboot${NC}"
-        ( (( USE_SSH_KEYS )) && ssh -o StrictHostKeyChecking=no "$SSH_USER@p${n}.local" "sudo reboot" || sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@p${n}.local" "sudo reboot" ) &>/tmp/reboot.log &
-        spin $! "rebooting"
-        TASKS+=("p$n: reboot" "Success")
-        wait_for_node "$n" || ok=0
-        run_ssh_cmd "$n" "sudo apt install -y chrony; echo 'server $MASTER_IP iburst' | sudo tee /etc/chrony/conf.d/master.conf; sudo systemctl restart chrony; chronyc makestep" "   ${BLUE}Chrony${NC}" || ok=0
-        verify_time_sync "$n" || ok=0
-        (( ok )) && echo -e "   ${GREEN}p$n recovered${NC}\n"
+    local offline=()
+    for node in "${NODES[@]}"; do
+        ping -c 1 -W 1 "$node.local" &>/dev/null && status "$node.local online" || {
+            error "$node.local offline"; offline+=("$node")
+        }
     done
-}
 
-# === Main ===
-clear
-rotate_logs
-load_config
+    [[ ${#offline[@]} -eq 0 ]] && return
 
-echo -e "${BOLD}${YELLOW}ClusterCtrl Time Sync $VERSION${NC}\n────────────────────────────────────────"
-echo -e "${CYAN}Author: UntrustedTech${NC}\nLog: $LOGFILE\n"
-
-# === Inputs ===
-MODE="${MODE:-auto}"
-AUTH_METHOD="${AUTH_METHOD:-keys}"
-
-read -p "${BOLD}Mode [1=Auto, 2=Assisted] (default: $MODE): ${NC}" mode_choice
-[[ -n "$mode_choice" ]] && MODE=$(( mode_choice == 2 ? "assisted" : "auto" ))
-
-USE_SSH_KEYS=0
-read -p "${BOLD}Auth [1=Password, 2=SSH Keys] (default: $AUTH_METHOD): ${NC}" auth_choice
-[[ -z "$auth_choice" ]] && auth_choice=$(( AUTH_METHOD == "keys" ? 2 : 1 ))
-
-if [[ -z "${SSH_USER:-}" || -z "${SSH_PASS:-}" ]]; then
-    read -p "Worker SSH User: " SSH_USER
-    read -s -p "Worker SSH Pass: " SSH_PASS; echo
-    [[ -z "$SSH_USER" || -z "$SSH_PASS" ]] && { echo -e "${RED}Credentials required${NC}"; exit 1; }
-    save_config
-else
-    echo -e "   ${GREEN}Using saved credentials${NC}\n"
-fi
-
-(( auth_choice == 2 )) && USE_SSH_KEYS=1
-
-pre_flight_check
-
-# === Master ===
-echo -e "${BOLD}${CYAN}Master Node${NC}\n──────────────"
-run_ssh_cmd "M" "sudo apt update -y" "   ${BLUE}Update${NC}" || true
-run_ssh_cmd "M" "sudo apt full-upgrade -y" "   ${BLUE}Upgrade${NC}" || true
-run_ssh_cmd "M" "sudo apt install -y chrony" "   ${BLUE}Install chrony${NC}" || true
-echo -n "   ${BLUE}Config chrony${NC}"
-sudo bash -c "sed -i '/^#pool/d' /etc/chrony/chrony.conf; echo -e 'allow 10.55.0.0/24\nlocal stratum 10' >> /etc/chrony/chrony.conf; systemctl restart chrony" &>/dev/null && printf " ${GREEN}%s${NC}\n\n" "$CHECK" && TASKS+=("Master: config" "Success") || TASKS+=("Master: config" "Failed")
-
-MASTER_IP=$(hostname -I | awk '{print $1}')
-
-(( USE_SSH_KEYS )) && deploy_master_ssh_key
-
-# === Workers ===
-for n in {1..4}; do
-    [[ "$MODE" == "assisted" ]] && { read -t 10 -p "Continue p$n? [Y/n/skip]: " a || a=y; [[ "$a" =~ ^[Nn]$ ]] && continue; [[ "$a" =~ ^[Ss]$ ]] && { echo "   Skipped p$n"; TASKS+=("p$n: Skipped" "User"); continue; }; }
-    echo -e "${BOLD}${CYAN}p${n}${NC}\n──────"
-    local ok=1
-    ensure_node_on "$n" || ok=0
-    run_ssh_cmd "$n" "sudo apt update -y" "   ${BLUE}Update${NC}" || ok=0
-    run_ssh_cmd "$n" "sudo apt full-upgrade -y" "   ${BLUE}Upgrade${NC}" || ok=0
-    run_ssh_cmd "$n" "sudo apt autoremove -y" "   ${BLUE}Clean${NC}" || ok=0
-    # Reboot
-    echo -n "   ${BLUE}Reboot${NC}"
-    ( (( USE_SSH_KEYS )) && ssh -o StrictHostKeyChecking=no "$SSH_USER@p${n}.local" "sudo reboot" || sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@p${n}.local" "sudo reboot" ) &>/tmp/reboot.log &
-    spin $! "rebooting"
-    TASKS+=("p$n: reboot" "Success")
-    wait_for_node "$n" || ok=0
-    run_ssh_cmd "$n" "sudo apt install -y chrony; echo 'server $MASTER_IP iburst' | sudo tee /etc/chrony/conf.d/master.conf; sudo systemctl restart chrony; chronyc makestep" "   ${BLUE}Chrony${NC}" || ok=0
-    verify_time_sync "$n" || ok=0
-    (( ok )) && echo -e "   ${GREEN}p${n} synced${NC}\n" || echo -e "   ${RED}p${n} failed${NC}\n"
-done
-
-retry_failed_nodes
-
-# === Final Report ===
-echo -e "${BOLD}${PURPLE}FINAL TASK REPORT${NC}"
-printf " ${BOLD}%-50s %-12s${NC}\n" "Task" "Status"
-printf " ${BOLD}%-50s %-12s${NC}\n" "──────────────────────────────────────────────────" "────────────"
-for ((i=0; i<${#TASKS[@]}; i+=2)); do
-    local task="${TASKS[i]}"
-    local status="${TASKS[i+1]}"
-    case "$status" in
-        "Success") color="$GREEN" icon="$CHECK" ;;
-        "Failed")  color="$RED"   icon="$CROSS" ;;
-        *)         color="$YELLOW" icon="$WARN" ;;
+    read -p " $(echo -e "${CYAN}Power on? (all/specific/none): ${NC}")" action
+    case "$action" in
+        all)     clusterctrl on p1 p2 p3 p4 &>/dev/null & spinner $! "Powering all..." ;;
+        specific)
+            read -p " Nodes: " nodes
+            clusterctrl on $nodes &>/dev/null & spinner $! "Powering $nodes..."
+            ;;
+        *) warning "Skipped"; return ;;
     esac
-    printf " %-50s ${color}%s %s${NC}\n" "$task" "$icon" "$status"
-done
 
-(( ${#FAILED_NODES[@]} == 0 )) && echo -e "\n${BOLD}${GREEN}Cluster fully synchronized!${NC}" || {
-    echo -e "\n${BOLD}${RED}Sync incomplete:${NC}"
-    for n in "${FAILED_NODES[@]}"; do echo -e "   • ${RED}$n${NC}: ${FAILURE_REASONS[$n]}"; done
-    echo -e "   ${YELLOW}Log: $LOGFILE${NC}"
+    echo -e "\n${CYAN}Waiting for boot...${NC}"
+    for node in "${offline[@]}"; do
+        echo -n "  $node.local: "
+        while ! ping -c 1 -W 1 "$node.local" &>/dev/null; do
+            for c in ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏; do
+                printf "$MAGENTA$c$NC"; sleep 0.1; printf "\b"
+            done
+        done
+        echo -e "\r  $node.local: ${GREEN}Success online${NC}"
+    done
 }
-echo
 
+# -----------------------------
+# 3. SSH Credentials
+# -----------------------------
+get_credentials() {
+    print_header "SSH CREDENTIALS"
+    read -p " $(echo -e "${CYAN}Same for all? (y/n): ${NC}")" -n 1 -r; echo
+
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        read -p "  Username: " USER
+        read -s -p "  Password: " PASS; echo
+        USERS=("$USER" "$USER" "$USER" "$USER")
+        PASSES=("$PASS" "$PASS" "$PASS" "$PASS")
+        status "Shared credentials"
+    else
+        USERS=(); PASSES=()
+        for node in "${NODES[@]}"; do
+            read -p "  Username for $node: " u
+            read -s -p "  Password for $node: " p; echo
+            USERS+=("$u"); PASSES+=("$p")
+        done
+        status "Individual credentials"
+    fi
+}
+
+# -----------------------------
+# 4. SSH Key Setup
+# -----------------------------
+setup_ssh_keys() {
+    print_header "SSH KEY SETUP"
+    local keys_ok=true
+    for i in {0..3}; do
+        ! ssh -o BatchMode=yes -o ConnectTimeout=5 "${USERS[$i]}@${NODES[$i]}.local" "exit" 2>/dev/null && keys_ok=false
+    done
+
+    $keys_ok && { status "Passwordless ready"; return; }
+
+    read -p " $(echo -e "${CYAN}Set up keys? (y/n): ${NC}")" -n 1 -r; echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { warning "Skipped"; return; }
+
+    [[ ! -f ~/.ssh/id_rsa ]] && {
+        ssh-keygen -t rsa -b 4096 -N "" -f ~/.ssh/id_rsa &>/dev/null &
+        spinner $! "Generating key..."
+    }
+
+    echo -e "\n${GREEN}Distributing key...${NC}"
+    for i in {0..3}; do
+        local node=${NODES[$i]} user=${USERS[$i]} pass=${PASSES[$i]}
+        run_ssh "sshpass -p '$pass' ssh-copy-id -i ~/.ssh/id_rsa.pub '$user@$node.local'" "$node" "Copying key"
+    done
+}
+
+# -----------------------------
+# 5. PARALLEL WORKER UPDATES
+# -----------------------------
+update_workers() {
+    print_header "PARALLEL WORKER UPDATES"
+    read -p " $(echo -e "${CYAN}Update all in parallel? (y/n): ${NC}")" -n 1 -r; echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && { warning "Skipped"; return; }
+
+    local pids=()
+    for i in {0..3}; do
+        local node=${NODES[$i]} user=${USERS[$i]} pass=${PASSES[$i]}
+        local label="p$((i+1))"
+        local ssh_cmd="ssh $user@$node.local"
+        ssh -o BatchMode=yes "$user@$node.local" "exit" 2>/dev/null || ssh_cmd="sshpass -p '$pass' ssh $user@$node.local"
+
+        (
+            echo -e "${BOLD}STARTING $label.local${NC}"
+            run_ssh "$ssh_cmd 'sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y'" "$label" "Updating" || true
+
+            echo -n "  $label: Rebooting"
+            $ssh_cmd "sudo reboot" &>/dev/null
+            while ! ping -c 1 -W 1 "$node.local" &>/dev/null; do
+                printf "."; sleep 2
+            done
+            echo -e " ${GREEN}Success back online${NC}"
+        ) &
+        pids+=($!)
+    done
+
+    echo -e "\n${CYAN}Waiting for all updates...${NC}"
+    for pid in "${pids[@]}"; do
+        wait $pid && status "Update $pid done" || log_error "Update $pid failed"
+    done
+}
+
+# -----------------------------
+# 6. PARALLEL NTP (CHRONY) SYNC
+# -----------------------------
+setup_chrony() {
+    print_header "PARALLEL NTP SYNC (CHRONY)"
+
+    # Master
+    run_apt "sudo apt install -y chrony" "Installing chrony (master)"
+    sudo sed -i 's/^pool/#pool/' /etc/chrony/chrony.conf 2>/dev/null
+    echo -e "local stratum 10\nallow 172.19.181.0/24" | sudo tee -a /etc/chrony/chrony.conf > /dev/null
+    sudo systemctl restart chrony &>/dev/null
+    status "Master NTP: $MASTER_IP"
+
+    # Workers (Parallel)
+    local pids=()
+    for i in {0..3}; do
+        local node=${NODES[$i]} user=${USERS[$i]} pass=${PASSES[$i]}
+        local label="p$((i+1))"
+        local ssh_cmd="ssh $user@$node.local"
+        ssh -o BatchMode=yes "$user@$node.local" "exit" 2>/dev/null || ssh_cmd="sshpass -p '$pass' ssh $user@$node.local"
+
+        (
+            run_ssh "$ssh_cmd 'sudo apt install -y chrony'" "$label" "Installing" || true
+            run_ssh "$ssh_cmd 'sudo sed -i \"s/^pool/#pool/\" /etc/chrony/chrony.conf 2>/dev/null'" "$label" "Disabling pools" || true
+            run_ssh "$ssh_cmd 'echo \"server $MASTER_IP iburst\" | sudo tee /etc/chrony/chrony.conf > /dev/null'" "$label" "Setting master" || true
+            run_ssh "$ssh_cmd 'sudo systemctl restart chrony'" "$label" "Restarting" || true
+        ) &
+        pids+=($!)
+    done
+
+    echo -e "\n${CYAN}Waiting for NTP sync...${NC}"
+    for pid in "${pids[@]}"; do
+        wait $pid && status "NTP $pid done" || log_error "NTP $pid failed"
+    done
+}
+
+# -----------------------------
+# 7. Final Health Check
+# -----------------------------
+final_check() {
+    print_header "HEALTH CHECK"
+    echo -e "${CYAN}Connectivity:${NC}"
+    status "Master ($MASTER_NAME) online"
+    for node in "${NODES[@]}"; do
+        ping -c 1 -W 1 "$node.local" &>/dev/null && status "$node.local online" || {
+            error "$node.local offline"; log_error "Final: $node offline"
+        }
+    done
+
+    echo -e "\n${CYAN}NTP Synchronization:${NC}"
+    for i in {0..3}; do
+        local node=${NODES[$i]} user=${USERS[$i]} pass=${PASSES[$i]}
+        local label="p$((i+1))"
+        local ssh_cmd="ssh $user@$node.local"
+        ssh -o BatchMode=yes "$user@$node.local" "exit" 2>/dev/null || ssh_cmd="sshpass -p '$pass' ssh $user@$node.local"
+        local sync=$($ssh_cmd "chronyc tracking 2>/dev/null | grep -i 'Reference ID' || echo 'none'" 2>/dev/null)
+        [[ "$sync" == *"(172.19.181.1)"* ]] && status "$label NTP synced" || {
+            error "$label NTP failed"; log_error "NTP sync failed: $label"
+        }
+    done
+}
+
+# -----------------------------
+# 8. Summary
+# -----------------------------
+show_summary() {
+    print_header "SETUP COMPLETE"
+
+    if [ -z "$ERRORS" ]; then
+        echo -e "${GREEN}Cluster ready in record time!${NC}\n"
+        echo -e "${YELLOW}ClusterCtrl Time Sync v1.0${NC}"
+        echo -e "${DIM}by UntrustedTech • https://github.com/UntrustedTech${NC}"
+    else
+        echo -e "${RED}ISSUES:${NC}"
+        echo -e "${RED}$ERRORS${NC}\n"
+        echo -e "${YELLOW}Fix and re-run.${NC}"
+    fi
+}
+
+# -----------------------------
+# Main
+# -----------------------------
+main() {
+    ensure_sshpass
+    setup_master
+    check_network
+    get_credentials
+    setup_ssh_keys
+    update_workers
+    setup_chrony
+    final_check
+    show_summary
+}
+
+main
 # Copyright (c) 2025 UntrustedTech. All rights reserved.
 # Unauthorized copying, modification, or distribution prohibited.
